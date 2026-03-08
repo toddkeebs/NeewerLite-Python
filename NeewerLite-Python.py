@@ -174,6 +174,8 @@ defaultLightPresets = [
     ]
 
 customLightPresets = defaultLightPresets[:] # copy the default presets to the list for the current session's presets
+hardwareMACOverrides = {} # map of BLE GUID/MAC to hardware MAC (used for Infinity lights on macOS)
+pendingHWMacOverride = "" # temporary CLI override passed via --hwmac
 
 threadAction = "" # the current action to take from the thread
 serverBusy = [False, ""] # whether or not the HTTP server is busy
@@ -200,6 +202,7 @@ lockFile = tempfile.gettempdir() + os.sep + "NeewerLite-Python.lock"
 anotherInstance = False # whether or not we're using a new instance (for the Singleton check)
 globalPrefsFile = os.path.dirname(os.path.abspath(sys.argv[0])) + os.sep + "light_prefs" + os.sep + "NeewerLite-Python.prefs" # the global preferences file for saving/loading
 customLightPresetsFile = os.path.dirname(os.path.abspath(sys.argv[0])) + os.sep + "light_prefs" + os.sep + "customLights.prefs"
+hardwareMACOverridesFile = os.path.dirname(os.path.abspath(sys.argv[0])) + os.sep + "light_prefs" + os.sep + "hardwareMACs.prefs"
 
 # FILE LOCKING FOR SINGLE INSTANCE
 def singleInstanceLock():
@@ -2927,6 +2930,27 @@ def loadCustomPresets():
             customLightPresets[6] = paramsList
         elif "customPreset7=" in customPresets[a]:
             customLightPresets[7] = paramsList
+
+def loadHardwareMACOverrides():
+    global hardwareMACOverrides
+
+    if not os.path.exists(hardwareMACOverridesFile):
+        return
+
+    with open(hardwareMACOverridesFile, mode="r", encoding="utf-8") as fileToOpen:
+        lines = fileToOpen.read().splitlines()
+
+    for line in lines:
+        line = line.strip()
+        if line == "" or line.startswith("#"):
+            continue
+
+        if "=" in line:
+            key, value = line.split("=", 1)
+            key = key.strip().upper()
+            value = value.strip().upper()
+            if key != "" and value != "":
+                hardwareMACOverrides[key] = value
             
 # RETURN THE CORRECT NAME FOR THE IDENTIFIER OF THE LIGHT (FOR DEBUG STRINGS)
 def returnMACname():
@@ -2983,6 +3007,9 @@ def printDebugString(theString):
                 serverBusy[1] = ""
 
 def splitMACAddress(MACAddress, returnInt = False):
+    if MACAddress == None:
+        raise ValueError("Hardware MAC address is missing (Infinity light on macOS). Close other apps and re-scan, or check system_profiler output.")
+
     MACAddress = MACAddress.split(":")
 
     if returnInt == False:
@@ -3298,9 +3325,9 @@ def updateStatus(splitString = "", infinityMode = 0, customValue = None):
 
 # Use this class to store information in a format that plays nicer with Bleak > 0.19
 class UpdatedBLEInformation:
-    def __init__(self, name, address, rssi, HWMACaddr = None):
+    def __init__(self, name, address, rssi, HWMACaddr = None, realname = None):
         self.name = name # the corrected name of this device (SL90 Pro)
-        self.realname = name # the real name of this device (NW-2342520000FFF, etc.)
+        self.realname = realname if realname != None else name # the real name of this device (NW-2342520000FFF, etc.)
         self.address = address # the MAC address (or in the case of MacOS, the GUID)
         self.rssi = rssi # the signal level of this device
         self.HWMACaddr = HWMACaddr # the exact MAC address (needed for MacOS) of this device
@@ -3335,12 +3362,20 @@ async def findDevices(limitToDevices = None):
     for d in devices: # go through all of the devices Bleak just found
         if limitToDevices != None: # we're looking for devices using the CLI, so we need *specific* MAC addresses/GUIDs
             if d.address in limitToDevices:
+                raw_name = d.name
                 d.name = getCorrectedName(d.name)
+                d.realname = raw_name
+                if d.address.upper() in hardwareMACOverrides:
+                    d.HWMACaddr = hardwareMACOverrides[d.address.upper()]
                 currentScan.append(d)
         else: # we're doing a normal device discovery/re-discovery scan
             if d.address in whiteListedMACs: # if the MAC address is in the list of whitelisted addresses, add this device
                 printDebugString(f"Matching whitelisted address found - {returnMACname()} {d.address}, adding to the list")
+                raw_name = d.name
                 d.name = getCorrectedName(d.name)
+                d.realname = raw_name
+                if d.address.upper() in hardwareMACOverrides:
+                    d.HWMACaddr = hardwareMACOverrides[d.address.upper()]
                 currentScan.append(d)
             else: # if this device is not whitelisted, check to see if it's valid (contains "NEEWER" in the name)
                 if d.name != None:
@@ -3348,7 +3383,11 @@ async def findDevices(limitToDevices = None):
 
                     for a in range(len(acceptedPrefixes)):
                         if acceptedPrefixes[a] in d.name:
+                            raw_name = d.name
                             d.name = getCorrectedName(d.name) # fix the "newer" light names, like NW-20220057 with their correct names, like SL90 Pro
+                            d.realname = raw_name
+                            if d.address.upper() in hardwareMACOverrides:
+                                d.HWMACaddr = hardwareMACOverrides[d.address.upper()]
                             currentScan.append(d)
                             break
 
@@ -3589,13 +3628,31 @@ async def connectToLight(selectedLight, updateGUI=True):
                     command = ["system_profiler", "SPBluetoothDataType"]
                     output = run(command, stdout=PIPE, universal_newlines=True)
                     # get the location in the above output dealing with the specific light we're working with
-                    light_offset = output.stdout.find(availableLights[selectedLight][0].realname)
-                    # find the address adjacent from the above location
-                    address_offset = output.stdout.find("Address: ", light_offset)
-                    # clip out the MAC address itself
-                    output_parse = output.stdout[address_offset + 9:address_offset + 26]
+                    search_names = [availableLights[selectedLight][0].realname, availableLights[selectedLight][0].name]
+                    output_parse = ""
 
-                    availableLights[selectedLight][0].HWMACaddr = output_parse
+                    for search_name in search_names:
+                        if search_name != None and search_name != "":
+                            light_offset = output.stdout.find(search_name)
+                            if light_offset != -1:
+                                # find the address adjacent from the above location
+                                address_offset = output.stdout.find("Address: ", light_offset)
+                                if address_offset != -1:
+                                    # clip out the MAC address itself
+                                    output_parse = output.stdout[address_offset + 9:address_offset + 26]
+                                    break
+
+                    if output_parse != "" and ":" in output_parse:
+                        availableLights[selectedLight][0].HWMACaddr = output_parse
+                    else:
+                        # if a manual override exists for this light, use it
+                        override_key = availableLights[selectedLight][0].address.upper()
+                        if override_key in hardwareMACOverrides:
+                            availableLights[selectedLight][0].HWMACaddr = hardwareMACOverrides[override_key]
+                            printDebugString(">> Using hardware MAC override from --hwmac")
+                        else:
+                            availableLights[selectedLight][0].HWMACaddr = None
+                            printDebugString(">> Could not locate Hardware MAC address in system_profiler output")
                 else: # we're on a system that uses MAC addresses, so just duplicate the information
                     availableLights[selectedLight][0].HWMACaddr = availableLights[selectedLight][0].address
                 
@@ -4066,7 +4123,7 @@ def processCommands(listToProcess=[]):
 
     # ARGUMENTS EACH MODE HAS ACCESS TO
     # 3-17-24 - added Infinity-style effect parameters to the list after --force_instance
-    acceptable_arguments = ["--light", "--mode", "--temp", "--hue", "--sat", "--bri", "--intensity",
+    acceptable_arguments = ["--light", "--mode", "--temp", "--hue", "--sat", "--bri", "--intensity", "--hwmac",
                             "gm", "--scene", "--animation", "--list", "--on", "--off", "--force_instance",
                             "bright_min", "bright_max", "temp_min", "temp_max", "hue_min", "hue_max",
                             "speed", "sparks", "specialOptions"]
@@ -4135,6 +4192,7 @@ def processCommands(listToProcess=[]):
     parser.add_argument("--on", action="store_true", help="Turn the light on")
     parser.add_argument("--off", action="store_true", help="Turn the light off")
     parser.add_argument("--light", default="", help="The MAC Address (XX:XX:XX:XX:XX:XX) of the light you want to send a command to or ALL to find and control all lights (only valid when also using --cli switch)")
+    parser.add_argument("--hwmac", default="", help="Override hardware MAC for Infinity lights on macOS (format: AA:BB:CC:DD:EE:FF)")
     parser.add_argument("--mode", default="CCT", help="[DEFAULT: CCT] The current control mode - options are HSI, CCT and either ANM or SCENE")
     parser.add_argument("--temp", "--temperature", default="56", help="[DEFAULT: 56(00)K] (CCT mode) - the color temperature (3200K+) to set the light to")
     parser.add_argument("--hue", default="240", help="[DEFAULT: 240] (HSI mode) - the hue (0-360 degrees) to set the light to")
@@ -4155,6 +4213,8 @@ def processCommands(listToProcess=[]):
     parser.add_argument("--specialoptions", "--specialOptions", default="1", help="[DEFAULT: 1] (Infinity light SCENE mode) Special options for the current scene")
 
     args = parser.parse_args(listToProcess)
+    global pendingHWMacOverride
+    pendingHWMacOverride = args.hwmac
 
     if args.force_instance == False: # if this value is True, then don't do anything
         global anotherInstance
@@ -4795,6 +4855,8 @@ if __name__ == '__main__':
 
     if os.path.exists(customLightPresetsFile):
         loadCustomPresets() # if there's a custom mapping for presets, then load that into memory
+    if os.path.exists(hardwareMACOverridesFile):
+        loadHardwareMACOverrides() # load any hardware MAC overrides for Infinity lights
 
     setUpAsyncio() # set up the asyncio loop
     cmdReturn = [True] # initially set to show the GUI interface over the CLI interface
@@ -4909,6 +4971,16 @@ if __name__ == '__main__':
                     printDebugString(f'            {MACAddresses[a]}')
 
                 printDebugString("-------------------------------------------------------------------------------------")
+
+                if pendingHWMacOverride != "":
+                    override_list = pendingHWMacOverride.upper().split(",")
+                    if len(override_list) == 1:
+                        hardwareMACOverrides[MACAddresses[0]] = override_list[0]
+                    elif len(override_list) == len(MACAddresses):
+                        for i in range(len(MACAddresses)):
+                            hardwareMACOverrides[MACAddresses[i]] = override_list[i]
+                    else:
+                        printDebugString(" >> Warning: --hwmac count does not match --light count, ignoring overrides")
 
                 asyncioEventLoop.run_until_complete(findDevices(limitToDevices = MACAddresses)) # get Bleak object linking to this specific light and getting custom prefs
             else:
